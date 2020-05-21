@@ -1,64 +1,38 @@
+/* Copyright (c) 2020 Gabriel Manoel
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/ptrace.h>
 #include <sys/wait.h>
-#include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <string.h>
 #include <ctype.h>
 #include <stdarg.h>
-#include <sys/user.h>
-#include <stdint.h>
 #include <limits.h>
 
-#define PERM_READ   1
-#define PERM_WRITE  2
-#define PERM_EXEC   4
-#define PERM_SHARED 8
-#define PERM_PRIVATE 16
-
-typedef uint64_t addr64_t;
-typedef uint32_t addr32_t;
-typedef addr32_t addr_rel32_t;
-
-struct mmap_region {
-    addr64_t base;
-    addr64_t end;
-    size_t size;
-    int perms;
-    addr32_t offset;
-    // dev;
-    // inode;
-    char *mapped_file;
-};
-
-struct process_image {
-    int pid;
-    struct mmap_region *regions;
-    size_t regions_num;
-};
-
-#define bytearray(var) (uint8_t *)&(var)
-
-static int attach_to_process(int pid);
-static int detach_from_process(int pid);
-
-static void *fmmap(void *addr, size_t *length, int prot, int flags, const char *pathname, off_t offset);
-
-static void parse_proc_line(const char *line, struct mmap_region *buf);
-static void read_mem_regions(struct process_image *process);
-static struct process_image *create_proc_image(int pid);
-static void destroy_proc_image(struct process_image *image);
-
-static size_t pheader_size(addr32_t offset, const char *file);
-static void hexdump(uint8_t *bytes, size_t length, ...);
-
-size_t c_fmtlen(const char *format, ...);
-size_t c_vsprintf_alloc(char **buf, const char *format, va_list ap);
-size_t c_sprintf_alloc(char **buf, const char *format, ...);
-size_t c_vfmtlen(const char *format, va_list ap);
+#include "CHelper/string_utils.h"
+#include "injector.h"
 
 static int attach_to_process(int pid)
 {
@@ -259,7 +233,6 @@ int main(int argc, char *argv[])
 
     unsigned char hook_asm[8] = "\xe9\x00\x00\x00\x00\x90\x90\x90";
 
-
     if (argc < 4) {
         fprintf(stderr, "usage: ./injector shellcode address_to_hook target_pid\n");
         exit(0);
@@ -283,7 +256,6 @@ int main(int argc, char *argv[])
         fprintf(stderr, "error mapping \"%s\"\n", shellcode);
         exit(1);
     }
-
     printf("gathering information about the process image\n");
     process = create_proc_image(target_pid);
     if (!process) {
@@ -329,7 +301,9 @@ int main(int argc, char *argv[])
     printf("writing shellcode...\n");
     hook_address_jmpto = padding_start - (padding_start+4+sizeof(original_bytes)+5+shellcode_sz);
 
+    // FIXME: if shellcode is a empty file then it will segfault at injector.c::289
     *(int*)(shellcode_mmaped+(shellcode_sz-4)) = hook_address_jmpto;
+    printf("here\n");
     hexdump(shellcode_mmaped, shellcode_sz);
 
     for (size_t i = 0; i < shellcode_sz; i+=sizeof(unsigned long))
@@ -343,60 +317,4 @@ int main(int argc, char *argv[])
     detach_from_process(target_pid);
 
     printf("** It worked!! :)\n...or maybe not ¯\\_(ツ)_/¯\n");
-}
-
-size_t c_fmtlen(const char *format, ...)
-{
-    va_list ap;
-    size_t len;
-
-    va_start(ap, format);
-    len = c_vfmtlen(format, ap);
-    va_end(ap);
-
-    return len;
-}
-
-size_t c_vfmtlen(const char *format, va_list ap)
-{
-    va_list ap_copy;
-    char dummy_buffer[1];
-    size_t len;
-
-    if (!format)
-        return 0;
-
-    va_copy(ap_copy, ap);
-    // vsnprintf() returns the number that would have been written
-    len = vsnprintf(dummy_buffer, 1, format, ap_copy);
-    va_end(ap);
-
-    return len;
-}
-
-/*
- * calls c_vsprintf_alloc() internally.
- */
-size_t c_sprintf_alloc(char **buf, const char *format, ...)
-{
-    va_list ap;
-    size_t written;
-
-    va_start(ap, format);
-    written = c_vsprintf_alloc(buf, format, ap);
-    va_end(ap);
-
-    return written;
-}
-
-/*
- * Sames as vsprintf, but it allocates a buffer using c_malloc().
- * The caller should free() the buffer when done using it.
- *
- * The c_malloc() function aborts in case of ENOMEM.
- */
-size_t c_vsprintf_alloc(char **buf, const char *format, va_list ap)
-{
-    *buf = malloc(c_vfmtlen(format, ap));
-    return vsprintf(*buf, format, ap);
 }
