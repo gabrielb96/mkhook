@@ -249,15 +249,15 @@ static void hexdump(uint8_t *bytes, size_t length, ...)
 
 int main(int argc, char *argv[])
 {
-    const char *shellcode = NULL;
-    void *shellcode_mmaped = NULL;
-    addr_rel32_t address_to_hook;
+    const char *new_func = NULL;
+    void *new_func_mmaped = NULL;
+    size_t new_func_sz = 0;
+    addr_rel32_t func_rel_address;
     int target_pid;
     struct process_image *process = NULL;
     struct mmap_region *text_segment = NULL;
     addr_rel32_t padding_start;
 
-    size_t shellcode_sz = 0;
     unsigned long original_bytes;
     unsigned char add_rsp_8[4] = "\x48\x83\xc4\x08";    // add  rsp, 0x8
     unsigned char jmpn_function[5] = "\xe9\xfc\xff\xff\xff";  //	jmp near function_address
@@ -266,24 +266,24 @@ int main(int argc, char *argv[])
     size_t trampoline_sz;
 
     if (argc < 4) {
-        fprintf(stderr, "usage: ./injector shellcode address_to_hook target_pid\n");
+        fprintf(stderr, "usage: ./injector new_function function_address target_pid\n");
         exit(0);
     }
 
-    shellcode = argv[1];
-    address_to_hook = strtoul(argv[2], NULL, 16);
+    new_func = argv[1];
+    func_rel_address = strtoul(argv[2], NULL, 16);
     target_pid = atoi(argv[3]);
 
     printf("attaching to target %d\n", target_pid);
     if (attach_to_process(target_pid) != 0)
-        fatal(errno, "failed to attach to proces");
+        fatal(errno, "failed to attach to process");
 
-    printf("reading shellcode (%s)...\n", shellcode);
-    shellcode_mmaped = fmmap(0, &shellcode_sz, PROT_READ | PROT_WRITE, MAP_PRIVATE, shellcode, 0);
-    if (!shellcode_mmaped)
-        fatal(errno, "error when reading shellcode");
+    printf("reading new_func (%s)\n", new_func);
+    new_func_mmaped = fmmap(0, &new_func_sz, PROT_READ | PROT_WRITE, MAP_PRIVATE, new_func, 0);
+    if (!new_func_mmaped)
+        fatal(errno, "error when reading new_func");
 
-    printf("gathering information about the process image\n");
+    printf("gathering information about the process..\n");
     process = create_proc_image(target_pid);
     if (!process)
         fatal(errno, "/proc/[pid]/maps not available");
@@ -295,37 +295,36 @@ int main(int argc, char *argv[])
         }
     }
     printf(".text segment at 0x%lx with size 0x%lx\n", text_segment->base, text_segment->size);
+    func_rel_address += text_segment->base;
 
     padding_start = pheader_size(text_segment->offset, text_segment->mapped_file) + text_segment->base;
     printf("padding start at address 0x%x\n", padding_start);
 
-    original_bytes = ptrace(PTRACE_PEEKTEXT, target_pid, address_to_hook, NULL);
+    original_bytes = ptrace(PTRACE_PEEKTEXT, target_pid, func_rel_address, NULL);
     printf("original bytes: ");
     hexdump(bytearray(original_bytes), sizeof(original_bytes));
 
-    patch_bytearray(hook_asm, 1, (padding_start+17) - (address_to_hook+5), addr_rel32_t);
+    patch_bytearray(hook_asm, 1, (padding_start+17) - (func_rel_address+5), addr_rel32_t);
     patch_bytearray(hook_asm, 7, (original_bytes >> 7 * 8), unsigned char);
 
-    printf("writing hook to function: ");
+    printf("writing trampoline: ");
     hexdump(hook_asm, sizeof(hook_asm));
-    write_to_process(target_pid, address_to_hook, hook_asm, sizeof(hook_asm));
+    write_to_process(target_pid, func_rel_address, hook_asm, sizeof(hook_asm));
 
-    patch_bytearray(jmpn_function, 1, (address_to_hook +7) - (padding_start + 17), addr_rel32_t);
-    printf("writing trampoline...\n");
-
+    patch_bytearray(jmpn_function, 1, (func_rel_address+7) - (padding_start + 17), addr_rel32_t);
     ptrace(PTRACE_POKETEXT, target_pid, padding_start, *(unsigned long *)add_rsp_8);
     ptrace(PTRACE_POKETEXT, target_pid, padding_start+4, original_bytes);
     ptrace(PTRACE_POKETEXT, target_pid, padding_start+4+sizeof(original_bytes), *(unsigned long *)jmpn_function);
 
-    printf("writing shellcode...\n");
-    // FIXME: if shellcode is a empty file then it will segfault
-    patch_bytearray(shellcode_mmaped, shellcode_sz-4, padding_start - (padding_start+4+sizeof(original_bytes)+5+shellcode_sz), addr_rel32_t);
-    hexdump(shellcode_mmaped, shellcode_sz);
+    printf("writing new function...\n");
+    // FIXME: if new_func is a empty file then it will segfault
+    patch_bytearray(new_func_mmaped, new_func_sz-4, padding_start - (padding_start+4+sizeof(original_bytes)+5+new_func_sz), addr_rel32_t);
+    hexdump(new_func_mmaped, new_func_sz);
 
-    write_to_process(target_pid, padding_start+4+sizeof(original_bytes)+5, shellcode_mmaped, shellcode_sz);
+    write_to_process(target_pid, padding_start+4+sizeof(original_bytes)+5, new_func_mmaped, new_func_sz);
 
     destroy_proc_image(process);
-    munmap(shellcode_mmaped, shellcode_sz);
+    munmap(new_func_mmaped, new_func_sz);
 
     printf("detaching from target\n");
     detach_from_process(target_pid);
