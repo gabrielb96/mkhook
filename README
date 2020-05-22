@@ -1,0 +1,56 @@
+This tool uses the padding space used in ELF binaries for proper alignment to store the new code.
+
+We first overwrite the first bytes at the adress given with a jmp instruction
+that jumps to the start of the new code. The code finishes with a call to the
+trampoline function that executes the original instructions that was overwritten
+and jumps back to the rest of the original function.
+
+Here is a few ugly ascii diagrams to help understand (or at least I hope it does):
+
+        +-------------------+
+0x1000  |  start of .text   |
+        |        ...        |
+0x1234  |     functionA     |
+        |        ...        |
+        |        ...        |
+0x1400  | start of padding  |
+        |        ...        |
+0x2000  |    end of .text   |
+        +-------------------+
+
+In the example above we have 0x600 worth of padding space to work with. Plenty of space.
+The next step is to overwrite the original bytes at functionA to jmp to the address where
+our new code will be.
+
+        +-------------------+
+0x1000  |  start of .text   |
+        |        ...        |
+0x1234  |    jmp to hook    |>-\
+        | rest of functionA |  |
+        |        ...        |  |
+ 0x1400 |  start of padding |  |
+ 0x1420 |  functionA_hook   |<-/
+        |        ...        |
+ 0x2000 |   end of .text    |
+        +-------------------+
+
+With the jump set, we now write the trampoline function and functionA_hook to the padding space.
+The trampoline is called at the end of functionA_hook and is responsible to return to the right
+location at functionA.
+
+         +-------------------+
+0x1000   | start of .text    |
+         |        ...        |
+0x1234   |   jmp to hook     |>-\
+       />| rest of functionA |  |
+       | |                   |  |
+       | |                   |  |
+0x1400 \-|    trampoline     |<--|-\
+0x1420   |  functionA_hook   |<-/  |
+         |   call trampoline |>----/
+         |        ...        |
+0x2000   |   end of .text    |
+         +-------------------+
+
+This is still a work-in-progress. There are still many bugs and lack of features (a lot).
+It will probably not work outside of the example program, but be happy to play with it if you want to try. :)
