@@ -1,6 +1,8 @@
 .gdb_history
+.clangd
 *.
 *.bin
 example_shellcode.o
 build
 vulnerable_program
+compile_commands.json

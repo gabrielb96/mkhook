@@ -54,16 +54,4 @@ struct process_image {
 };
 
 #define bytearray(var) (uint8_t *)&(var)
-
-static int attach_to_process(int pid);
-static int detach_from_process(int pid);
-
-static void *fmmap(void *addr, size_t *length, int prot, int flags, const char *pathname, off_t offset);
-
-static void parse_proc_line(const char *line, struct mmap_region *buf);
-static void read_mem_regions(struct process_image *process);
-static struct process_image *create_proc_image(int pid);
-static void destroy_proc_image(struct process_image *image);
-
-static size_t pheader_size(addr32_t offset, const char *file);
-static void hexdump(uint8_t *bytes, size_t length, ...);
+#define patch_bytearray(var, location, value, _typeof) *(_typeof *)(var+(location)) = (value)
