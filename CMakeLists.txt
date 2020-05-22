@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.17)
 
-project(Mkhook C)
+project(MKhook C)
 
 set(EXECUTABLE_PATH /usr/bin)
 

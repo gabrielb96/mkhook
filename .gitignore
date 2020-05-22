@@ -2,7 +2,7 @@
 .clangd
 *.
 *.bin
-example_shellcode.o
+*.o
 build
 vulnerable_program
 compile_commands.json
